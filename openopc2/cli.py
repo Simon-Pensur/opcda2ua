@@ -1,6 +1,7 @@
 """
 Command line interface for OpenOPC Service
 """
+import asyncio
 from typing import Optional, List, Dict, Any, Tuple, cast
 
 from Pyro5.errors import CommunicationError
@@ -326,10 +327,48 @@ def server_info(
     Console().print(table)
 
 @app.command()
+def serve_ua(
+    opc_server: str = typer.Option(None, help="OPC DA server name"),
+    opc_host: str = typer.Option("localhost", help="OPC DA host"),
+    ua_endpoint: str = typer.Option("opc.tcp://0.0.0.0:4840/openopc2/", help="OPC UA endpoint"),
+    log_level: LogLevel = LogLevelOption,
+) -> None:
+    """
+    Start OPC DA to OPC UA bridge server.
+
+    This command starts a server that exposes all OPC DA variables
+    as OPC UA nodes, allowing remote clients to access OPC DA data
+    without requiring DCOM or Pyro.
+    """
+    log.setLevel(log_level.upper())
+
+    try:
+        from openopc2.ua_server import OpcDaUaBridge
+    except ImportError:
+        print("Error: asyncua is required for OPC UA bridge.")
+        print("Install with: pip install openopc2[ua] or pip install asyncua")
+        raise typer.Exit(1)
+
+    config = OpenOpcConfig()
+    if opc_server:
+        config.OPC_SERVER = opc_server
+    config.OPC_HOST = opc_host
+
+    bridge = OpcDaUaBridge(config)
+    bridge.set_endpoint(ua_endpoint)
+
+    try:
+        asyncio.run(bridge.start(opc_server, opc_host))
+    except KeyboardInterrupt:
+        bridge.stop()
+        print("\nBridge stopped.")
+
+
+@app.command()
 def list_config(
 ) -> None:
     """
-    Write values
+    List configuration values
     """
     OpenOpcConfig().print_config()
 
