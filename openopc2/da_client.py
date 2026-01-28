@@ -16,7 +16,9 @@ import string
 import sys
 import time
 import uuid
+import threading
 from multiprocessing import Queue
+from queue import Queue as ThreadQueue, Empty
 
 import Pyro5.core
 
@@ -114,6 +116,17 @@ class GroupEvents:
         self.client.callback_queue.put((TransactionID, ClientHandles, ItemValues, Qualities, TimeStamps))
 
 
+class SubscriptionGroupEvents:
+    """Handles callbacks for persistent subscriptions (separate from async reads)"""
+    def __init__(self):
+        self.client = current_client
+
+    def OnDataChange(self, TransactionID, NumItems, ClientHandles, ItemValues, Qualities, TimeStamps):
+        self.client._subscription_queue.put(
+            (TransactionID, ClientHandles, ItemValues, Qualities, TimeStamps)
+        )
+
+
 @Pyro5.api.expose  # needed for 4.55+
 class OpcDaClient:
     def __init__(self, open_opc_config: OpenOpcConfig = OpenOpcConfig()):
@@ -143,6 +156,19 @@ class OpcDaClient:
         self.callback_queue = Queue()
         self._event = win32event.CreateEvent(None, 0, 0, None)
 
+        # Subscription data structures (separate from read() groups)
+        self._subscription_groups = {}           # {group_name: subgroup_count}
+        self._subscription_tags = {}             # {subgroup: [tags]}
+        self._subscription_valid_tags = {}       # {subgroup: [valid_tags]}
+        self._subscription_server_handles = {}   # {subgroup: {tag: server_handle}}
+        self._subscription_handles_tag = {}      # {subgroup: {client_handle: tag}}
+        self._subscription_hooks = {}            # {subgroup: SubscriptionGroupEvents}
+        self._subscription_callbacks = {}        # {group_name: callback_function}
+        self._subscription_queue = ThreadQueue() # Queue for subscription events
+        self._subscription_thread = None         # Event processing thread
+        self._subscription_thread_active = False
+        self._subscription_lock = threading.Lock()
+
     def set_trace(self, trace):
         if self._open_serv is None:
             self.trace = trace
@@ -169,11 +195,30 @@ class OpcDaClient:
         self._group_handles_tag = {}
         self._group_hooks = {}
 
+        # Clear subscription data on reconnect
+        self._subscription_groups = {}
+        self._subscription_tags = {}
+        self._subscription_valid_tags = {}
+        self._subscription_server_handles = {}
+        self._subscription_handles_tag = {}
+        self._subscription_hooks = {}
+        self._subscription_callbacks = {}
+
     def GUID(self):
         return self._open_guid
 
     def close(self, del_object=True):
         """Disconnect from the currently connected OPC server"""
+
+        # Cancel all subscriptions before disconnecting
+        for group in list(self._subscription_groups.keys()):
+            try:
+                self.unsubscribe(group=group)
+            except:
+                pass
+
+        # Stop subscription thread
+        self._stop_subscription_thread()
 
         try:
             self.remove(self.groups())
@@ -1048,6 +1093,265 @@ class OpcDaClient:
         """Update the session's last transaction time in the Gateway Service"""
         if self._open_serv:
             self._open_serv.tx_times[self._open_guid] = time.time()
+
+    def subscribe(self, tags, callback, group, update_rate=1000, deadband=0.0):
+        """
+        Create persistent subscription to OPC DA data changes.
+
+        Args:
+            tags: str | list[str] - Tags to subscribe to
+            callback: callable - Function called when values change
+                     Signature: callback(changes) where changes = [(tag, value, quality, timestamp), ...]
+            group: str - Group name (required)
+            update_rate: int - Update frequency in ms (default: 1000)
+            deadband: float - Dead band 0-100% (default: 0.0)
+
+        Returns:
+            list[str] - Successfully subscribed tags
+
+        Raises:
+            ValueError: If group is None or callback is not callable
+            OPCError: If OPC operation error occurs
+        """
+        if group is None:
+            raise ValueError("subscribe(): 'group' parameter is required")
+        if not callable(callback):
+            raise ValueError("subscribe(): 'callback' parameter must be callable")
+
+        tags, single, valid = type_check(tags)
+        if not valid:
+            raise TypeError("subscribe(): 'tags' parameter must be a string or a list of strings")
+
+        try:
+            # Determine subgroup name
+            if group in self._subscription_groups:
+                gid = self._subscription_groups[group]
+            else:
+                gid = 0
+                self._subscription_groups[group] = 1
+
+            sub_group = f"SUB_{group}.{gid}"
+
+            opc_groups = self._opc.groups
+            opc_groups.DefaultGroupUpdateRate = update_rate
+
+            # Create OPC group
+            if self.trace:
+                self.trace(f'AddGroup({sub_group})')
+            opc_group = opc_groups.Add(sub_group)
+            opc_group.IsSubscribed = 1
+            opc_group.IsActive = 1
+            opc_group.UpdateRate = update_rate
+            opc_group.DeadBand = deadband
+
+            opc_items = opc_group.OPCItems
+
+            # Validate tags
+            names = list(tags)
+            names.insert(0, 0)
+            errors = []
+
+            if self.trace:
+                self.trace(f'Validate({tags})')
+
+            try:
+                errors = opc_items.Validate(len(names) - 1, names)
+            except:
+                pass
+
+            valid_tags = []
+            client_handles = []
+
+            if sub_group not in self._subscription_handles_tag:
+                self._subscription_handles_tag[sub_group] = {}
+                n = 0
+            else:
+                n = max(self._subscription_handles_tag[sub_group]) + 1 if self._subscription_handles_tag[sub_group] else 0
+
+            for i, tag in enumerate(tags):
+                if errors[i] == 0:
+                    valid_tags.append(tag)
+                    client_handles.append(n)
+                    self._subscription_handles_tag[sub_group][n] = tag
+                    n += 1
+                elif self.trace:
+                    self.trace(f'{tag} failed validation')
+
+            # Add items
+            client_handles.insert(0, 0)
+            valid_tags.insert(0, 0)
+
+            if self.trace:
+                self.trace(f'AddItems({valid_tags[1:]})')
+
+            try:
+                server_handles, errors = opc_items.AddItems(len(client_handles) - 1, valid_tags, client_handles)
+            except Exception as e:
+                log.exception("Error adding items to subscription group", exc_info=True)
+                raise OPCError(f"Failed to add items to subscription: {e}")
+
+            valid_tags.pop(0)
+
+            if sub_group not in self._subscription_server_handles:
+                self._subscription_server_handles[sub_group] = {}
+
+            final_valid_tags = []
+            for i, tag in enumerate(valid_tags):
+                if errors[i] == 0:
+                    final_valid_tags.append(tag)
+                    self._subscription_server_handles[sub_group][tag] = server_handles[i]
+                elif self.trace:
+                    self.trace(f'{tag} failed AddItems')
+
+            # Store subscription data
+            self._subscription_tags[sub_group] = tags
+            self._subscription_valid_tags[sub_group] = final_valid_tags
+            self._subscription_callbacks[group] = callback
+
+            # Create event hook
+            if self.trace:
+                self.trace(f'WithEvents({opc_group.Name})')
+            global current_client
+            current_client = self
+            self._subscription_hooks[sub_group] = win32com.client.WithEvents(opc_group, SubscriptionGroupEvents)
+
+            # Start event processing thread
+            self._start_subscription_thread()
+
+            log.info(f"Subscribed to {len(final_valid_tags)} tags in group '{group}'")
+            return final_valid_tags
+
+        except pythoncom.com_error as err:
+            error_msg = f'subscribe: {self._get_error_str(err)}'
+            raise OPCError(error_msg)
+
+    def unsubscribe(self, tags=None, group=None):
+        """
+        Cancel subscriptions.
+
+        Args:
+            tags: str | list[str] | None - Specific tags to unsubscribe
+            group: str | None - Entire group to unsubscribe
+
+        Note: If group is specified, tags parameter is ignored
+        """
+        try:
+            opc_groups = self._opc.groups
+
+            if group is not None:
+                # Remove entire group
+                if group not in self._subscription_groups:
+                    return
+
+                for gid in range(self._subscription_groups[group]):
+                    sub_group = f"SUB_{group}.{gid}"
+
+                    if sub_group in self._subscription_hooks:
+                        if self.trace:
+                            self.trace(f'CloseEvents({sub_group})')
+                        self._subscription_hooks[sub_group].close()
+                        del self._subscription_hooks[sub_group]
+
+                    try:
+                        if self.trace:
+                            self.trace(f'RemoveGroup({sub_group})')
+                        opc_groups.Remove(sub_group)
+                    except pythoncom.com_error:
+                        pass
+
+                    # Clean up data structures
+                    if sub_group in self._subscription_tags:
+                        del self._subscription_tags[sub_group]
+                    if sub_group in self._subscription_valid_tags:
+                        del self._subscription_valid_tags[sub_group]
+                    if sub_group in self._subscription_handles_tag:
+                        del self._subscription_handles_tag[sub_group]
+                    if sub_group in self._subscription_server_handles:
+                        del self._subscription_server_handles[sub_group]
+
+                del self._subscription_groups[group]
+                if group in self._subscription_callbacks:
+                    del self._subscription_callbacks[group]
+
+                log.info(f"Unsubscribed from group '{group}'")
+
+            elif tags is not None:
+                # Remove specific tags (not yet implemented - remove whole group for now)
+                tags, single, valid = type_check(tags)
+                log.warning("Unsubscribing individual tags not yet implemented. Use group parameter.")
+
+        except pythoncom.com_error as err:
+            error_msg = f'unsubscribe: {self._get_error_str(err)}'
+            raise OPCError(error_msg)
+
+    def _subscription_event_loop(self):
+        """Event loop for processing subscription callbacks (runs in separate thread)"""
+        while self._subscription_thread_active:
+            try:
+                # Process COM messages (required for callbacks to arrive)
+                pythoncom.PumpWaitingMessages()
+
+                # Get events from queue
+                try:
+                    tx_id, handles, values, qualities, timestamps = self._subscription_queue.get(timeout=0.01)
+                except Empty:
+                    continue
+
+                # Find group and build changes list
+                changes = []
+                group_name = None
+
+                for sub_group, handles_map in self._subscription_handles_tag.items():
+                    for i, handle in enumerate(handles):
+                        if handle in handles_map:
+                            tag = handles_map[handle]
+                            quality = OpcCom.get_quality_string(qualities[i])
+                            timestamp = str(timestamps[i])
+                            changes.append((tag, values[i], quality, timestamp))
+                            # Extract group name from subgroup
+                            group_name = sub_group.split('.')[0].replace('SUB_', '')
+
+                # Execute user callback
+                if changes and group_name and group_name in self._subscription_callbacks:
+                    callback = self._subscription_callbacks[group_name]
+                    try:
+                        callback(changes)
+                    except Exception as e:
+                        log.error(f"Subscription callback error: {e}")
+
+            except Exception as e:
+                if self._subscription_thread_active:
+                    log.error(f"Subscription event loop error: {e}")
+
+    def _start_subscription_thread(self):
+        """Start event processing thread if not already running"""
+        with self._subscription_lock:
+            if self._subscription_thread is None or not self._subscription_thread.is_alive():
+                self._subscription_thread_active = True
+                self._subscription_thread = threading.Thread(
+                    target=self._subscription_event_loop,
+                    daemon=True
+                )
+                self._subscription_thread.start()
+                log.info("Subscription event thread started")
+
+    def _stop_subscription_thread(self):
+        """Stop event processing thread"""
+        self._subscription_thread_active = False
+        if self._subscription_thread:
+            self._subscription_thread.join(timeout=2.0)
+            self._subscription_thread = None
+            log.info("Subscription event thread stopped")
+
+    def list_subscriptions(self):
+        """Return dict {group: [tags]} of active subscriptions"""
+        result = {}
+        for sub_group, tags in self._subscription_valid_tags.items():
+            group_name = sub_group.split('.')[0].replace('SUB_', '')
+            if group_name not in result:
+                result[group_name] = []
+            result[group_name].extend(tags)
+        return result
 
     def __getitem__(self, key):
         """Read single item (tag as dictionary key)"""

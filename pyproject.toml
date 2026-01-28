@@ -25,6 +25,10 @@ WMI = { version = "^1.5.1", markers = "sys_platform == 'win32'" }
 pywin32 = { version = "304", markers = "sys_platform == 'win32'" }
 typer = { extras = ["all"], version = "^0.6.1" }
 rich = "^12.6.0"
+asyncua = { version = "^1.1", optional = true }
+
+[tool.poetry.extras]
+ua = ["asyncua"]
 
 [tool.poetry.group.dev.dependencies]
 coverage = "^6.5.0"
