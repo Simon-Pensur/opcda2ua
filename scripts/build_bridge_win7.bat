@@ -57,7 +57,7 @@ REM Build with Python 3.8
 cd /d "%SCRIPT_DIR%"
 echo.
 echo Building executable with Python 3.8...
-py -3.8 -m PyInstaller --clean OpcDaUaBridge.spec
+py -3.8 -m PyInstaller --clean opcda2ua.spec
 
 if %errorlevel% neq 0 (
     echo.
@@ -71,7 +71,7 @@ echo ============================================
 echo   Build completed successfully!
 echo ============================================
 echo.
-echo   Executable: %SCRIPT_DIR%dist\OpcDaUaBridge.exe
+echo   Executable: %SCRIPT_DIR%dist\opcda2ua.exe
 echo.
 echo   IMPORTANT for Windows 7 deployment:
 echo   Include vc_redist.x64.exe with the executable

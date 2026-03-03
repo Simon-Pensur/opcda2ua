@@ -1,7 +1,17 @@
-import Pyro5.api
+try:
+    import Pyro5.api
+    PYRO_AVAILABLE = True
+except ImportError:
+    PYRO_AVAILABLE = False
 
 
-@Pyro5.api.expose
+def _pyro_expose(cls):
+    if PYRO_AVAILABLE:
+        return Pyro5.api.expose(cls)
+    return cls
+
+
+@_pyro_expose
 class TimeoutError(Exception):
     def __init__(self, txt):
         Exception.__init__(self, txt)
@@ -9,7 +19,7 @@ class TimeoutError(Exception):
     __dict__ = None
 
 
-@Pyro5.api.expose
+@_pyro_expose
 class OPCError(Exception):
     def __init__(self, message):
         super(OPCError, self).__init__(self, message)
