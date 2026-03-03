@@ -16,3 +16,4 @@ poetry.lock
 .direnv
 .tool-versions
 .envrc
+.claude/settings.local.json

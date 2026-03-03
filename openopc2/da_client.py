@@ -20,7 +20,11 @@ import threading
 from multiprocessing import Queue
 from queue import Queue as ThreadQueue, Empty
 
-import Pyro5.core
+try:
+    import Pyro5.api
+    PYRO_AVAILABLE = True
+except ImportError:
+    PYRO_AVAILABLE = False
 
 from openopc2 import system_health
 from openopc2.config import OpenOpcConfig
@@ -127,7 +131,14 @@ class SubscriptionGroupEvents:
         )
 
 
-@Pyro5.api.expose  # needed for 4.55+
+def _pyro_expose(cls):
+    """Decorator that applies Pyro5 expose if available, otherwise no-op"""
+    if PYRO_AVAILABLE:
+        return Pyro5.api.expose(cls)
+    return cls
+
+
+@_pyro_expose
 class OpcDaClient:
     def __init__(self, open_opc_config: OpenOpcConfig = OpenOpcConfig()):
         """Instantiate OPC automation class"""
@@ -168,12 +179,13 @@ class OpcDaClient:
         self._subscription_thread = None         # Event processing thread
         self._subscription_thread_active = False
         self._subscription_lock = threading.Lock()
+        self._subscription_next_handle = 0       # Global counter for unique client handles
 
     def set_trace(self, trace):
         if self._open_serv is None:
             self.trace = trace
 
-    def connect(self, opc_server: str | None = None, opc_host: str = 'localhost'):
+    def connect(self, opc_server=None, opc_host='localhost'):
         """Connect to the specified OPC server"""
 
         log.info(f"OPC DA OpcDaClient connecting to {opc_server} {opc_host}")
@@ -203,6 +215,7 @@ class OpcDaClient:
         self._subscription_handles_tag = {}
         self._subscription_hooks = {}
         self._subscription_callbacks = {}
+        self._subscription_next_handle = 0  # Reset global handle counter
 
     def GUID(self):
         return self._open_guid
@@ -246,7 +259,7 @@ class OpcDaClient:
         def add_items(tags):
             names = list(tags)
 
-            names.insert(0, 0)
+            names.insert(0, "")
             errors = []
 
             if self.trace:
@@ -283,7 +296,7 @@ class OpcDaClient:
                     self.trace('%s failed validation' % tag)
 
             client_handles.insert(0, 0)
-            valid_tags.insert(0, 0)
+            valid_tags.insert(0, "")
             server_handles = []
             errors = []
 
@@ -711,7 +724,7 @@ class OpcDaClient:
                 tags = tag_groups[gid]
                 values = value_groups[gid]
 
-                names.insert(0, 0)
+                names.insert(0, "")
                 errors = []
 
                 try:
@@ -738,7 +751,7 @@ class OpcDaClient:
                         pass
 
                 client_handles.insert(0, 0)
-                valid_tags.insert(0, 0)
+                valid_tags.insert(0, "")
                 server_handles = []
                 errors = []
 
@@ -1148,7 +1161,7 @@ class OpcDaClient:
 
             # Validate tags
             names = list(tags)
-            names.insert(0, 0)
+            names.insert(0, "")
             errors = []
 
             if self.trace:
@@ -1164,22 +1177,20 @@ class OpcDaClient:
 
             if sub_group not in self._subscription_handles_tag:
                 self._subscription_handles_tag[sub_group] = {}
-                n = 0
-            else:
-                n = max(self._subscription_handles_tag[sub_group]) + 1 if self._subscription_handles_tag[sub_group] else 0
 
+            # Use global handle counter to ensure unique handles across all groups
             for i, tag in enumerate(tags):
                 if errors[i] == 0:
                     valid_tags.append(tag)
-                    client_handles.append(n)
-                    self._subscription_handles_tag[sub_group][n] = tag
-                    n += 1
+                    client_handles.append(self._subscription_next_handle)
+                    self._subscription_handles_tag[sub_group][self._subscription_next_handle] = tag
+                    self._subscription_next_handle += 1
                 elif self.trace:
                     self.trace(f'{tag} failed validation')
 
             # Add items
             client_handles.insert(0, 0)
-            valid_tags.insert(0, 0)
+            valid_tags.insert(0, "")
 
             if self.trace:
                 self.trace(f'AddItems({valid_tags[1:]})')
@@ -1301,7 +1312,9 @@ class OpcDaClient:
                 changes = []
                 group_name = None
 
-                for sub_group, handles_map in self._subscription_handles_tag.items():
+                # Make a copy to avoid "dictionary changed size during iteration"
+                handles_tag_copy = dict(self._subscription_handles_tag)
+                for sub_group, handles_map in handles_tag_copy.items():
                     for i, handle in enumerate(handles):
                         if handle in handles_map:
                             tag = handles_map[handle]

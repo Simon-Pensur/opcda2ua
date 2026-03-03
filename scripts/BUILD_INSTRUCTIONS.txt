@@ -1,0 +1,61 @@
+============================================
+  INSTRUCCIONES DE COMPILACION - opcda2ua
+============================================
+
+REQUISITOS:
+- Python 3.11 32-bit (para Win10/11)
+- Python 3.8 32-bit (para Win7)
+- Ambos deben ser 32-bit para compatibilidad con gbda_aut.dll
+
+UBICACIONES DE PYTHON 32-BIT:
+- Win10: C:\Users\justino\AppData\Local\Programs\Python\Python311-32\python.exe
+- Win7:  C:\Users\justino\AppData\Local\Programs\Python\Python38-32\python.exe
+
+============================================
+  COMPILAR PARA WINDOWS 10/11
+============================================
+
+cd c:\Users\justino\Downloads\github\opcda2ua\scripts
+
+"C:\Users\justino\AppData\Local\Programs\Python\Python311-32\python.exe" -m PyInstaller --clean opcda2ua.spec
+
+move /Y dist\opcda2ua.exe dist\opcda2ua_win10.exe
+
+============================================
+  COMPILAR PARA WINDOWS 7
+============================================
+
+cd c:\Users\justino\Downloads\github\opcda2ua\scripts
+
+"C:\Users\justino\AppData\Local\Programs\Python\Python38-32\python.exe" -m PyInstaller --clean opcda2ua.spec
+
+move /Y dist\opcda2ua.exe dist\opcda2ua_win7.exe
+
+============================================
+  INSTALAR DEPENDENCIAS (si es necesario)
+============================================
+
+Win10:
+"C:\Users\justino\AppData\Local\Programs\Python\Python311-32\python.exe" -m pip install pyinstaller asyncua pywin32
+
+Win7:
+"C:\Users\justino\AppData\Local\Programs\Python\Python38-32\python.exe" -m pip install pyinstaller asyncua pywin32
+
+============================================
+  NOTAS IMPORTANTES
+============================================
+
+1. Los ejecutables DEBEN ser 32-bit porque gbda_aut.dll es 32-bit
+2. Un proceso 64-bit NO puede cargar una DLL 32-bit
+3. El archivo opcda2ua.spec ya tiene todos los hiddenimports necesarios
+4. Los ejecutables generados quedan en: scripts\dist\
+
+============================================
+  USO DEL EJECUTABLE
+============================================
+
+opcda2ua_win10.exe --opc-server "Matrikon.OPC.Simulation.1"
+opcda2ua_win10.exe --opc-server "MyServer.1" --opc-host 192.168.1.100
+opcda2ua_win10.exe --help
+
+============================================

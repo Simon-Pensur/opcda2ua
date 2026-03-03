@@ -1,7 +1,11 @@
 import os
 import string
 
-import Pyro5.core
+try:
+    import Pyro5.api
+    PYRO_AVAILABLE = True
+except ImportError:
+    PYRO_AVAILABLE = False
 
 from openopc2.exceptions import OPCError
 from openopc2.opc_types import ACCESS_RIGHTS, OPC_QUALITY, TagPropertyItem, TagProperties
@@ -34,7 +38,13 @@ else:
     win32com_found = False
 
 
-@Pyro5.api.expose
+def _pyro_expose_com(cls):
+    if PYRO_AVAILABLE:
+        return Pyro5.api.expose(cls)
+    return cls
+
+
+@_pyro_expose_com
 class OpcCom:
     """
     This class handles the com interface of the OPC DA server.
@@ -42,7 +52,7 @@ class OpcCom:
 
     def __init__(self, opc_class: str):
         # TODO: Get browser type (hierarchical etc)
-        self.server: str | None = None
+        self.server = None
         self.host: str = 'localhost'
         self.groups = None
         self.opc_class = opc_class
@@ -69,7 +79,7 @@ class OpcCom:
             pythoncom.CoUninitialize()
             raise OPCError(f'Dispatch: {err} opc_class:"{opc_class}"')
 
-    def connect(self, server: str | None, host: str):
+    def connect(self, server, host):
         self.server = server
         self.host = host
         try:
