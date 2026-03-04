@@ -11,6 +11,10 @@ dist
 # Poetry
 poetry.lock
 
+# WinXP legacy bridge
+winxp/local/
+!winxp/opcda2ua_legacy.spec
+
 # Other
 .DS_Store
 .direnv
