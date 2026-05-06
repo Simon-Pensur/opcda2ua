@@ -151,6 +151,8 @@ class OpcDaUaBridge:
         self._ifix_optimized = False  # Optimized discovery for iFIX (enumerate containers, assume .F_CV)
         self._tag_refresh_interval = 600  # Tag refresh interval in seconds (default: 10 minutes)
         self._da_folder = None  # Reference to OPC DA tags folder for adding new nodes
+        self._description_batch_size = 500  # Batch size for fast iFIX description reads
+        self._skip_initial_read = False  # Skip slow initial value read; let subscriptions populate
 
     def set_endpoint(self, endpoint: str):
         """Configure OPC UA server endpoint"""
@@ -183,6 +185,49 @@ class OpcDaUaBridge:
     def set_tag_refresh_interval(self, seconds: int):
         """Configure tag refresh interval in seconds (0 to disable)"""
         self._tag_refresh_interval = seconds
+
+    def set_description_batch_size(self, n: int):
+        """Configure batch size for fast iFIX description reads"""
+        self._description_batch_size = n
+
+    def set_skip_initial_read(self, skip: bool):
+        """Skip slow initial value read; subscriptions will populate values."""
+        self._skip_initial_read = skip
+
+    def _datatype_for_tag(self, tag: str) -> "ua.NodeId":
+        """Pick the OPC UA DataType NodeId based on iFIX suffix conventions.
+
+        Used when creating the variable so that subsequent typed updates
+        (e.g. Double for .F_CV) match — even when the initial value is Null.
+        """
+        if tag.endswith('.A_CV') or tag.endswith('.A_DESC') or '.A_' in tag:
+            return ua.NodeId(ua.ObjectIds.String)
+        if tag.endswith('.F_CV'):
+            return ua.NodeId(ua.ObjectIds.Double)
+        return ua.NodeId(ua.ObjectIds.Double)
+
+    def _make_typed_variant(self, value, tag: str) -> "ua.Variant":
+        """Build a Variant with explicit VariantType matching the node's DataType.
+
+        Returns a Null variant when value is None — pair with an explicit
+        datatype= argument on add_variable so subsequent typed writes are
+        accepted (asyncua falls back to DataType when the stored variant
+        is Null).
+        """
+        if value is None:
+            return ua.Variant(None, ua.VariantType.Null)
+
+        if isinstance(value, bool):
+            return ua.Variant(value, ua.VariantType.Boolean)
+        if isinstance(value, float):
+            return ua.Variant(value, ua.VariantType.Double)
+        if isinstance(value, int):
+            if tag.endswith('.F_CV'):
+                return ua.Variant(float(value), ua.VariantType.Double)
+            return ua.Variant(value, ua.VariantType.Int64)
+        if isinstance(value, str):
+            return ua.Variant(value, ua.VariantType.String)
+        return ua.Variant(value)
 
     async def _setup_ua_server(self):
         """Configure the OPC UA server"""
@@ -217,37 +262,54 @@ class OpcDaUaBridge:
         for tag, value, quality, timestamp in tag_values:
             try:
                 # Convert pywintypes to standard Python types
-                original_value = value
                 original_type = type(value).__name__
                 value = convert_pywin_value(value)
 
-                # Use a default value based on type if the value is None
-                if value is None:
-                    value = 0  # Default to 0 for None values
-
-                # Log first few tags for debugging type issues
                 if len(self.ua_nodes) < 5:
                     log.info(f"Tag '{tag}': original_type={original_type}, value={value}, quality={quality}, python_type={type(value).__name__}")
 
-                # Create DataValue with quality status
-                ua_status = da_quality_to_ua_status(quality)
-                dv = ua.DataValue(ua.Variant(value), StatusCode_=ua_status)
+                # Build typed Variant (Null when value is None) and pick the
+                # node's DataType from the tag suffix — explicit datatype= is
+                # required so that future typed writes are accepted while the
+                # current value is Null.
+                variant = self._make_typed_variant(value, tag)
+                datatype = self._datatype_for_tag(tag)
 
-                # Create variable with initial value including quality
                 node = await da_folder.add_variable(
                     self.ua_namespace_idx,
                     tag,
-                    dv
+                    variant,
+                    datatype=datatype,
                 )
-                await node.set_writable()
+
+                # Read-only by default. set_writable() only when explicitly enabled
+                # — defense-in-depth against writes to live process systems.
+                if self._enable_writes:
+                    await node.set_writable()
+
+                # Apply quality via set_value:
+                # - Null value: BadWaitingForInitialData until first DA update
+                # - Non-Good DA quality: forward as-is
+                if value is None:
+                    dv = ua.DataValue(
+                        variant,
+                        StatusCode_=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData)
+                    )
+                    await node.set_value(dv)
+                elif quality != 'Good':
+                    ua_status = da_quality_to_ua_status(quality)
+                    dv = ua.DataValue(variant, StatusCode_=ua_status)
+                    await node.set_value(dv)
 
                 # Set description if available
                 if tag in tag_descriptions and tag_descriptions[tag]:
                     desc = ua.LocalizedText(tag_descriptions[tag])
-                    await node.write_attribute(ua.AttributeIds.Description, ua.DataValue(desc))
+                    await node.write_attribute(
+                        ua.AttributeIds.Description,
+                        ua.DataValue(ua.Variant(desc, ua.VariantType.LocalizedText))
+                    )
 
                 self.ua_nodes[tag] = node
-                # Store reverse mapping for write handling
                 node_id = node.nodeid.to_string()
                 self.ua_node_to_tag[node_id] = tag
             except Exception as e:
@@ -321,6 +383,82 @@ class OpcDaUaBridge:
         print(f"[PROGRESO] Descubrimiento completado en {elapsed:.1f} segundos")
 
         return tags
+
+    def _read_descriptions_ifix_fast(self, tags: List[str], batch_size: int = 500) -> Dict[str, str]:
+        """Read iFIX tag descriptions via batched SyncRead of .A_DESC siblings.
+
+        iFIX exposes the description as a sibling field NODE.TAG.A_DESC. Reading
+        these in batches via the standard OPC group / SyncRead mechanism is
+        dramatically faster than calling GetItemProperties one tag at a time
+        (one COM round-trip per tag).
+        """
+        import time
+        start = time.time()
+
+        desc_to_orig = {}
+        desc_tags = []
+        for tag in tags:
+            for suffix in ('.F_CV', '.A_CV'):
+                if tag.endswith(suffix):
+                    desc_tag = tag[:-len(suffix)] + '.A_DESC'
+                    desc_to_orig[desc_tag] = tag
+                    desc_tags.append(desc_tag)
+                    break
+
+        if not desc_tags:
+            log.warning("No .F_CV/.A_CV tags; cannot use iFIX fast description path")
+            return {}
+
+        print(f"[PROGRESO] Lectura rapida de descripciones (.A_DESC, batch={batch_size}, total={len(desc_tags)})")
+        log.info(f"Reading descriptions via .A_DESC fast path (batch={batch_size}, count={len(desc_tags)})")
+
+        descriptions = {}
+        bad_quality = 0
+        chunk_errors = 0
+        last_report = time.time()
+
+        for i in range(0, len(desc_tags), batch_size):
+            chunk = desc_tags[i:i + batch_size]
+            try:
+                # Anonymous group is created and auto-removed by iread()
+                results = self.da_client.read(chunk)
+            except Exception as e:
+                chunk_errors += 1
+                log.debug(f"Error reading description chunk at {i}: {e}")
+                continue
+
+            for desc_tag, value, quality, _ in results:
+                if quality not in ('Good', 'Uncertain'):
+                    bad_quality += 1
+                    continue
+                if value is None:
+                    continue
+                orig_tag = desc_to_orig.get(desc_tag)
+                if not orig_tag:
+                    continue
+                s = str(value).strip()
+                if s:
+                    descriptions[orig_tag] = s
+
+            now = time.time()
+            progress = min(i + batch_size, len(desc_tags))
+            if now - last_report >= 5 or progress >= len(desc_tags):
+                elapsed = now - start
+                rate = progress / elapsed if elapsed > 0 else 0
+                print(f"[PROGRESO] Descripciones: {progress}/{len(desc_tags)} "
+                      f"({progress * 100 // len(desc_tags)}%, {rate:.0f} tags/s)")
+                self._da_to_main_queue.put(('progress', f'descriptions {progress}/{len(desc_tags)}'))
+                last_report = now
+
+        elapsed = time.time() - start
+        rate = len(desc_tags) / elapsed if elapsed > 0 else 0
+        log.info(
+            f"iFIX descriptions read in {elapsed:.1f}s "
+            f"({rate:.0f} tags/s, {len(descriptions)} found, "
+            f"{bad_quality} bad quality, {chunk_errors} chunk errors)"
+        )
+        print(f"[PROGRESO] Descripciones leidas: {len(descriptions)}/{len(desc_tags)} en {elapsed:.1f}s ({rate:.0f} tags/s)")
+        return descriptions
 
     def _discover_tags_ifix_optimized(self) -> List[str]:
         """iFIX optimized discovery - navigate browser structure and build tag list
@@ -446,7 +584,7 @@ class OpcDaUaBridge:
 
         return value_tags
 
-    def _da_thread_main(self, opc_server: str, opc_host: str, ifix_only_fcv: bool = False, update_rate: int = 1000, include_descriptions: bool = False, ifix_optimized: bool = False, tag_refresh_interval: int = 600):
+    def _da_thread_main(self, opc_server: str, opc_host: str, ifix_only_fcv: bool = False, update_rate: int = 1000, include_descriptions: bool = False, ifix_optimized: bool = False, tag_refresh_interval: int = 600, skip_initial_read: bool = False):
         """Main thread for OPC DA (COM requires its own thread)"""
         import pythoncom
         pythoncom.CoInitialize()
@@ -492,94 +630,105 @@ class OpcDaUaBridge:
                 log.info("Using standard tag discovery")
                 tags = self._discover_tags_standard(ifix_only_fcv)
 
-            # Read initial values in chunks to show progress and avoid timeout
-            log.info("Reading initial values from OPC DA...")
-            print("[PROGRESO] Leyendo valores iniciales...")
+            # Read initial values, or skip and let subscriptions populate.
             tag_values = []
-            chunk_size = 100  # Smaller chunks for reliability
             total_tags = len(tags)
-            error_count = 0
 
-            def read_chunk_safe(tag_list):
-                """Read tags with fallback to smaller chunks on error"""
-                results = []
-                try:
-                    results = self.da_client.read(tag_list)
-                except Exception as e:
-                    # If chunk fails, try in smaller sub-chunks
-                    if len(tag_list) > 10:
-                        mid = len(tag_list) // 2
-                        results.extend(read_chunk_safe(tag_list[:mid]))
-                        results.extend(read_chunk_safe(tag_list[mid:]))
-                    else:
-                        # Try one by one for small chunks
-                        for tag in tag_list:
-                            try:
-                                r = self.da_client.read([tag])
-                                results.extend(r)
-                            except:
-                                # Create error result for failed tag
-                                results.append((tag, None, 'Error', None))
-                return results
+            if skip_initial_read:
+                # Skip the slow per-chunk SyncRead bootstrap. Each iFIX chunk
+                # creates+destroys an OPC group; iFIX/Graybox group lifecycle
+                # cost balloons over time (rate decays from ~45 tags/s to <1).
+                # Subscriptions will deliver real values within the first
+                # update_rate window after they activate.
+                log.info(f"Skipping initial value read for {total_tags} tags (--skip-initial-read)")
+                print(f"[PROGRESO] Saltando lectura inicial: {total_tags} tags quedaran en Null hasta primera suscripcion")
+                tag_values = [(tag, None, 'Bad', None) for tag in tags]
+                self._da_to_main_queue.put(('progress', total_tags))
+            else:
+                log.info("Reading initial values from OPC DA...")
+                print("[PROGRESO] Leyendo valores iniciales...")
+                chunk_size = 100  # Smaller chunks for reliability
+                error_count = 0
 
-            for i in range(0, total_tags, chunk_size):
-                chunk = tags[i:i + chunk_size]
-                chunk_values = read_chunk_safe(chunk)
+                def read_chunk_safe(tag_list):
+                    """Read tags with fallback to smaller chunks on error"""
+                    results = []
+                    try:
+                        results = self.da_client.read(tag_list)
+                    except Exception:
+                        if len(tag_list) > 10:
+                            mid = len(tag_list) // 2
+                            results.extend(read_chunk_safe(tag_list[:mid]))
+                            results.extend(read_chunk_safe(tag_list[mid:]))
+                        else:
+                            for tag in tag_list:
+                                try:
+                                    r = self.da_client.read([tag])
+                                    results.extend(r)
+                                except:
+                                    results.append((tag, None, 'Error', None))
+                    return results
 
-                # Filter out error results and count them
-                for tv in chunk_values:
-                    if tv[2] != 'Error':
-                        tag_values.append(tv)
-                    else:
-                        error_count += 1
+                for i in range(0, total_tags, chunk_size):
+                    chunk = tags[i:i + chunk_size]
+                    chunk_values = read_chunk_safe(chunk)
+                    for tv in chunk_values:
+                        if tv[2] != 'Error':
+                            tag_values.append(tv)
+                        else:
+                            error_count += 1
+                    progress = min(i + chunk_size, total_tags)
+                    if progress % 500 == 0 or progress >= total_tags:
+                        log.info(f"Read {progress}/{total_tags} tags ({100*progress//total_tags}%)")
+                        print(f"[PROGRESO] Leidos {progress}/{total_tags} tags")
+                    self._da_to_main_queue.put(('progress', progress))
 
-                # Report progress
-                progress = min(i + chunk_size, total_tags)
-                if progress % 500 == 0 or progress >= total_tags:
-                    log.info(f"Read {progress}/{total_tags} tags ({100*progress//total_tags}%)")
-                    print(f"[PROGRESO] Leidos {progress}/{total_tags} tags")
-
-                # Send progress event to reset timeout in main thread
-                self._da_to_main_queue.put(('progress', progress))
-
-            log.info(f"Finished reading {len(tag_values)} initial values ({error_count} errors)")
-            print(f"[PROGRESO] Lectura completada: {len(tag_values)} tags validos, {error_count} errores")
+                log.info(f"Finished reading {len(tag_values)} initial values ({error_count} errors)")
+                print(f"[PROGRESO] Lectura completada: {len(tag_values)} tags validos, {error_count} errores")
 
             # Read tag descriptions if enabled
             tag_descriptions = {}
             if include_descriptions:
-                print("[PROGRESO] Leyendo descripciones de tags...")
-                log.info("Reading tag descriptions from OPC DA...")
                 self._da_to_main_queue.put(('progress', 'reading descriptions'))
 
-                # Property ID 101 is ItemDescription in OPC DA spec
-                DESCRIPTION_PROPERTY_ID = 101
-                desc_count = 0
-                desc_errors = 0
+                if ifix_optimized:
+                    # Fast path for iFIX: batched SyncRead of .A_DESC siblings
+                    tag_descriptions = self._read_descriptions_ifix_fast(
+                        tags, batch_size=self._description_batch_size
+                    )
+                else:
+                    # Slow path: GetItemProperties (one COM round-trip per tag)
+                    print("[PROGRESO] Leyendo descripciones (GetItemProperties, serial)...")
+                    log.info("Reading tag descriptions via GetItemProperties (serial)...")
+                    DESCRIPTION_PROPERTY_ID = 101
+                    desc_count = 0
+                    desc_errors = 0
+                    desc_start = time.time()
 
-                for i, tag in enumerate(tags):
-                    try:
-                        # Read description property directly using GetItemProperties
-                        opc_client = self.da_client._opc.opc_client
-                        prop_values, errors = opc_client.GetItemProperties(
-                            tag, 1, [0, DESCRIPTION_PROPERTY_ID]
-                        )
-                        if prop_values and len(prop_values) > 0 and prop_values[0]:
-                            description = str(prop_values[0])
-                            if description and description.strip():
-                                tag_descriptions[tag] = description.strip()
-                                desc_count += 1
-                    except Exception as e:
-                        desc_errors += 1
-                        log.debug(f"Could not read description for '{tag}': {e}")
+                    for i, tag in enumerate(tags):
+                        try:
+                            opc_client = self.da_client._opc.opc_client
+                            prop_values, errors = opc_client.GetItemProperties(
+                                tag, 1, [0, DESCRIPTION_PROPERTY_ID]
+                            )
+                            if prop_values and len(prop_values) > 0 and prop_values[0]:
+                                description = str(prop_values[0])
+                                if description and description.strip():
+                                    tag_descriptions[tag] = description.strip()
+                                    desc_count += 1
+                        except Exception as e:
+                            desc_errors += 1
+                            log.debug(f"Could not read description for '{tag}': {e}")
 
-                    # Report progress every 500 tags
-                    if (i + 1) % 500 == 0:
-                        print(f"[PROGRESO] Descripciones leidas: {i + 1}/{len(tags)}")
-                        self._da_to_main_queue.put(('progress', f'descriptions {i + 1}/{len(tags)}'))
+                        if (i + 1) % 500 == 0:
+                            elapsed = time.time() - desc_start
+                            rate = (i + 1) / elapsed if elapsed > 0 else 0
+                            print(f"[PROGRESO] Descripciones leidas: {i + 1}/{len(tags)} ({rate:.0f} tags/s)")
+                            self._da_to_main_queue.put(('progress', f'descriptions {i + 1}/{len(tags)}'))
 
-                print(f"[PROGRESO] Descripciones leidas: {desc_count} de {len(tags)} tags")
-                log.info(f"Read {desc_count} descriptions ({desc_errors} errors)")
+                    desc_elapsed = time.time() - desc_start
+                    print(f"[PROGRESO] Descripciones leidas: {desc_count} de {len(tags)} en {desc_elapsed:.1f}s")
+                    log.info(f"Read {desc_count} descriptions in {desc_elapsed:.1f}s ({desc_errors} errors)")
 
             # Notify main thread of discovered tags with values (use DA->Main queue)
             self._da_to_main_queue.put(('tags_discovered', (tag_values, tag_descriptions)))
@@ -643,6 +792,14 @@ class OpcDaUaBridge:
                 try:
                     while True:
                         tag, value = self._write_queue.get_nowait()
+                        # Defense-in-depth: refuse writes unless explicitly enabled.
+                        # This is redundant with the WriteHandler check, but a hard
+                        # guard at the COM boundary protects live process systems.
+                        if not self._enable_writes:
+                            log.warning(
+                                f"BLOCKED write to OPC DA (writes disabled): {tag}={value}"
+                            )
+                            continue
                         try:
                             self.da_client.write((tag, value))
                             log.info(f"DA write successful: {tag} = {value}")
@@ -689,19 +846,24 @@ class OpcDaUaBridge:
                                 # Read descriptions for new tags if enabled
                                 new_descriptions = {}
                                 if include_descriptions:
-                                    DESCRIPTION_PROPERTY_ID = 101
-                                    opc_client = self.da_client._opc.opc_client
-                                    for tag in added_list:
-                                        try:
-                                            prop_values, errors = opc_client.GetItemProperties(
-                                                tag, 1, [0, DESCRIPTION_PROPERTY_ID]
-                                            )
-                                            if prop_values and len(prop_values) > 0 and prop_values[0]:
-                                                desc = str(prop_values[0]).strip()
-                                                if desc:
-                                                    new_descriptions[tag] = desc
-                                        except:
-                                            pass
+                                    if ifix_optimized:
+                                        new_descriptions = self._read_descriptions_ifix_fast(
+                                            added_list, batch_size=self._description_batch_size
+                                        )
+                                    else:
+                                        DESCRIPTION_PROPERTY_ID = 101
+                                        opc_client = self.da_client._opc.opc_client
+                                        for tag in added_list:
+                                            try:
+                                                prop_values, errors = opc_client.GetItemProperties(
+                                                    tag, 1, [0, DESCRIPTION_PROPERTY_ID]
+                                                )
+                                                if prop_values and len(prop_values) > 0 and prop_values[0]:
+                                                    desc = str(prop_values[0]).strip()
+                                                    if desc:
+                                                        new_descriptions[tag] = desc
+                                            except:
+                                                pass
 
                                 # Subscribe to new tags
                                 try:
@@ -768,30 +930,26 @@ class OpcDaUaBridge:
                         if tag in self.ua_nodes:
                             node = self.ua_nodes[tag]
                             try:
-                                # Convert pywintypes to standard Python types
-                                original_type = type(value).__name__
                                 value = convert_pywin_value(value)
-                                log.debug(f"Data change: {tag} = {value} (quality: {quality}, type: {original_type} -> {type(value).__name__})")
-                                # Mark as pending DA update BEFORE set_value to avoid write-back
                                 self._pending_da_updates.add(tag)
-                                # Store value from DA
                                 self._last_da_values[tag] = value
-                                # Convert DA quality to UA StatusCode
                                 ua_status = da_quality_to_ua_status(quality)
-                                # Use DataValue with value and quality
-                                dv = ua.DataValue(ua.Variant(value), StatusCode_=ua_status)
+                                # Use typed Variant matching the node's locked DataType
+                                variant = self._make_typed_variant(value, tag)
+                                dv = ua.DataValue(variant, StatusCode_=ua_status)
                                 await node.set_value(dv)
                             except Exception as e:
-                                # Remove from pending on error
                                 self._pending_da_updates.discard(tag)
-                                # If type mismatch, try converting datetime to string
                                 from datetime import datetime
                                 if isinstance(value, datetime):
                                     try:
                                         self._pending_da_updates.add(tag)
                                         str_value = value.isoformat()
                                         ua_status = da_quality_to_ua_status(quality)
-                                        dv = ua.DataValue(ua.Variant(str_value), StatusCode_=ua_status)
+                                        dv = ua.DataValue(
+                                            ua.Variant(str_value, ua.VariantType.String),
+                                            StatusCode_=ua_status
+                                        )
                                         await node.set_value(dv)
                                         self._last_da_values[tag] = str_value
                                     except Exception:
@@ -818,25 +976,36 @@ class OpcDaUaBridge:
                         if tag not in self.ua_nodes and self._da_folder is not None:
                             try:
                                 value = convert_pywin_value(value)
-                                if value is None:
-                                    value = 0
+                                variant = self._make_typed_variant(value, tag)
+                                datatype = self._datatype_for_tag(tag)
 
-                                # Create DataValue with quality status
-                                ua_status = da_quality_to_ua_status(quality)
-                                dv = ua.DataValue(ua.Variant(value), StatusCode_=ua_status)
-
-                                # Create variable with initial value including quality
                                 node = await self._da_folder.add_variable(
                                     self.ua_namespace_idx,
                                     tag,
-                                    dv
+                                    variant,
+                                    datatype=datatype,
                                 )
-                                await node.set_writable()
 
-                                # Set description if available
+                                if self._enable_writes:
+                                    await node.set_writable()
+
+                                if value is None:
+                                    dv = ua.DataValue(
+                                        variant,
+                                        StatusCode_=ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData)
+                                    )
+                                    await node.set_value(dv)
+                                elif quality != 'Good':
+                                    ua_status = da_quality_to_ua_status(quality)
+                                    dv = ua.DataValue(variant, StatusCode_=ua_status)
+                                    await node.set_value(dv)
+
                                 if tag in new_descriptions and new_descriptions[tag]:
                                     desc = ua.LocalizedText(new_descriptions[tag])
-                                    await node.write_attribute(ua.AttributeIds.Description, ua.DataValue(desc))
+                                    await node.write_attribute(
+                                        ua.AttributeIds.Description,
+                                        ua.DataValue(ua.Variant(desc, ua.VariantType.LocalizedText))
+                                    )
 
                                 self.ua_nodes[tag] = node
                                 node_id = node.nodeid.to_string()
@@ -890,7 +1059,7 @@ class OpcDaUaBridge:
         self.da_thread_active = True
         self.da_thread = threading.Thread(
             target=self._da_thread_main,
-            args=(opc_server, opc_host, self._ifix_only_fcv, self._update_rate, self._include_descriptions, self._ifix_optimized, self._tag_refresh_interval),
+            args=(opc_server, opc_host, self._ifix_only_fcv, self._update_rate, self._include_descriptions, self._ifix_optimized, self._tag_refresh_interval, self._skip_initial_read),
             daemon=True
         )
         self.da_thread.start()
@@ -1036,6 +1205,12 @@ Notas:
                         help='Intervalo de refresco de tags en segundos (default: 600 = 10 min, 0 para deshabilitar)')
     parser.add_argument('--discover', type=int, nargs='?', const=200, default=None,
                         help='Modo descubrimiento: lista los primeros N tags (default: 200) con info detallada y sale')
+    parser.add_argument('--description-batch-size', type=int, default=500,
+                        help='Tamaño de batch para lectura rapida de descripciones en iFIX (default: 500)')
+    parser.add_argument('--benchmark-descriptions', type=int, nargs='?', const=2000, default=None,
+                        help='Compara metodos de lectura de descripciones sobre N tags (default 2000) y sale')
+    parser.add_argument('--skip-initial-read', action='store_true',
+                        help='Saltar la lectura inicial de valores (acelera bootstrap ~13x). Los nodos UA arrancan con valor Null y StatusCode BadWaitingForInitialData; las suscripciones populan con los datos reales en la primera notificacion (~update_rate ms)')
     args = parser.parse_args()
 
     # Verificar que la DLL wrapper de OPC esta instalada
@@ -1332,6 +1507,131 @@ Notas:
             traceback.print_exc()
         sys.exit(0)
 
+    # Modo benchmark de descripciones
+    if args.benchmark_descriptions is not None:
+        if not args.opc_server:
+            print("\nERROR: --opc-server requerido para benchmark")
+            sys.exit(1)
+        sample_size = args.benchmark_descriptions
+        print(f"\n{'='*70}")
+        print(f"BENCHMARK DESCRIPCIONES — sample objetivo: {sample_size} tags")
+        print(f"{'='*70}\n")
+
+        try:
+            import pythoncom, time as _time
+            pythoncom.CoInitialize()
+            client = OpcDaClient(config)
+            client.connect(args.opc_server, args.opc_host)
+            print(f"Conectado a {args.opc_server}")
+
+            # Reuse the bridge's discovery so results are realistic
+            bench_bridge = OpcDaUaBridge(config)
+            bench_bridge.da_client = client
+
+            print("\n[1/3] Descubriendo tags...")
+            disc_start = _time.time()
+            if args.ifix_optimized:
+                tags = bench_bridge._discover_tags_ifix_optimized()
+            else:
+                tags = bench_bridge._discover_tags_standard(args.ifix_only_fcv)
+            print(f"      {len(tags)} tags en {_time.time() - disc_start:.1f}s")
+
+            # Filter to value tags suitable for fast path
+            value_tags = [t for t in tags if t.endswith('.F_CV') or t.endswith('.A_CV')]
+            if not value_tags:
+                value_tags = tags
+
+            # Pick spread sample
+            if len(value_tags) > sample_size:
+                step = max(1, len(value_tags) // sample_size)
+                sample = value_tags[::step][:sample_size]
+            else:
+                sample = value_tags
+            print(f"      Sample efectivo: {len(sample)} tags\n")
+
+            # Slow path: GetItemProperties
+            print("[2/3] Metodo lento: GetItemProperties (1 llamada COM por tag)...")
+            DESCRIPTION_PROPERTY_ID = 101
+            opc_client = client._opc.opc_client
+            slow_start = _time.time()
+            slow_found = 0
+            for tag in sample:
+                try:
+                    prop_values, _errs = opc_client.GetItemProperties(
+                        tag, 1, [0, DESCRIPTION_PROPERTY_ID]
+                    )
+                    if prop_values and len(prop_values) > 0 and prop_values[0]:
+                        if str(prop_values[0]).strip():
+                            slow_found += 1
+                except Exception:
+                    pass
+            slow_elapsed = _time.time() - slow_start
+            slow_rate = len(sample) / slow_elapsed if slow_elapsed > 0 else 0
+            print(f"      {len(sample)} tags en {slow_elapsed:.2f}s "
+                  f"({slow_rate:.0f} tags/s, {slow_found} encontradas)\n")
+
+            # Fast path at multiple batch sizes
+            print("[3/3] Metodo rapido: lectura batch de .A_DESC")
+            desc_to_orig = {}
+            desc_tags = []
+            for tag in sample:
+                for suffix in ('.F_CV', '.A_CV'):
+                    if tag.endswith(suffix):
+                        dt = tag[:-len(suffix)] + '.A_DESC'
+                        desc_to_orig[dt] = tag
+                        desc_tags.append(dt)
+                        break
+            print(f"      {len(desc_tags)} desc-tags derivados\n")
+
+            results = []
+            for bs in [100, 200, 500, 1000, 2000, 5000]:
+                if bs > len(desc_tags) and results:
+                    break
+                actual_bs = min(bs, len(desc_tags))
+                fast_start = _time.time()
+                fast_found = 0
+                err = None
+                try:
+                    for i in range(0, len(desc_tags), actual_bs):
+                        chunk = desc_tags[i:i + actual_bs]
+                        read_results = client.read(chunk)
+                        for _dt, value, quality, _ in read_results:
+                            if quality in ('Good', 'Uncertain') and value is not None:
+                                if str(value).strip():
+                                    fast_found += 1
+                except Exception as e:
+                    err = str(e)
+                fast_elapsed = _time.time() - fast_start
+                if err:
+                    print(f"      batch={actual_bs:>5}: ERROR — {err}")
+                    continue
+                rate = len(desc_tags) / fast_elapsed if fast_elapsed > 0 else 0
+                speedup = slow_elapsed / fast_elapsed if fast_elapsed > 0 else 0
+                results.append((actual_bs, fast_elapsed, rate, fast_found, speedup))
+                print(f"      batch={actual_bs:>5}: {fast_elapsed:>6.2f}s "
+                      f"({rate:>7.0f} tags/s, {fast_found} encontradas, {speedup:>5.1f}x mas rapido)")
+
+            print(f"\n{'='*70}")
+            if results:
+                best = min(results, key=lambda r: r[1])
+                projected_full = (len(value_tags) / best[2]) if best[2] > 0 else 0
+                projected_slow = (len(value_tags) / slow_rate) if slow_rate > 0 else 0
+                print(f"MEJOR batch_size: {best[0]} ({best[1]:.2f}s en sample, "
+                      f"{best[2]:.0f} tags/s, {best[4]:.1f}x speedup)")
+                print(f"Proyeccion para los {len(value_tags)} tags totales:")
+                print(f"  - Lento:  {projected_slow:.1f}s ({projected_slow/60:.1f} min)")
+                print(f"  - Rapido: {projected_full:.1f}s ({projected_full/60:.1f} min)")
+                print(f"\nRecomendacion: --description-batch-size {best[0]}")
+            print(f"{'='*70}\n")
+
+            client.close()
+            pythoncom.CoUninitialize()
+        except Exception as e:
+            print(f"\nERROR en benchmark: {e}")
+            import traceback
+            traceback.print_exc()
+        sys.exit(0)
+
     # Verificar que se especificó el servidor
     if not args.opc_server:
         print("\nERROR: Debe especificar --opc-server o usar --list-servers")
@@ -1350,15 +1650,25 @@ Notas:
     bridge.set_include_descriptions(not args.no_descriptions)
     bridge.set_ifix_optimized(args.ifix_optimized)
     bridge.set_tag_refresh_interval(args.tag_refresh_interval)
+    bridge.set_description_batch_size(args.description_batch_size)
+    bridge.set_skip_initial_read(args.skip_initial_read)
 
     if args.ifix_optimized:
-        print("\n*** Modo iFIX optimizado: enumerando contenedores y asumiendo .F_CV ***\n")
+        print("\n*** Modo iFIX optimizado: enumerando contenedores y asumiendo .F_CV ***")
+        print(f"*** Descripciones via .A_DESC en batches de {args.description_batch_size} ***")
+
+    if args.skip_initial_read:
+        print("*** Lectura inicial deshabilitada: nodos arrancan en Null hasta primera suscripcion ***\n")
+    elif args.ifix_optimized:
+        print()
 
     if args.tag_refresh_interval > 0:
         print(f"*** Refresco de tags cada {args.tag_refresh_interval} segundos ({args.tag_refresh_interval // 60} minutos) ***\n")
 
     if args.enable_writes:
         print("\n*** ADVERTENCIA: Escrituras habilitadas. Los clientes UA pueden modificar valores en OPC DA ***\n")
+    else:
+        print("*** Bridge en modo SOLO LECTURA (escrituras a OPC DA deshabilitadas) ***\n")
 
     try:
         asyncio.run(bridge.start(args.opc_server, args.opc_host, ifix_only_fcv=args.ifix_only_fcv))

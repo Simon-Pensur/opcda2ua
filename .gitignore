@@ -15,6 +15,9 @@ poetry.lock
 winxp/local/
 !winxp/opcda2ua_legacy.spec
 
+# Win10 bridge spec — needed for reproducible PyInstaller builds
+!scripts/opcda2ua.spec
+
 # Other
 .DS_Store
 .direnv
