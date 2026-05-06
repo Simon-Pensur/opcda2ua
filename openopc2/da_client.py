@@ -1229,6 +1229,25 @@ class OpcDaClient:
             # Start event processing thread
             self._start_subscription_thread()
 
+            # Force the OPC DA server to push current values for ALL items in the
+            # group via DataChange. iFIX/Graybox doesn't auto-emit on AddItems for
+            # subscribed groups, so without this slow-changing process variables
+            # remain in BadWaitingForInitialData until they next change (hours/days).
+            # AsyncRefresh from cache is one COM call per group (~21 for 20k tags)
+            # and does not block — values flow in via the existing event hook.
+            try:
+                if self._tx_id >= 0xFFFF:
+                    self._tx_id = 0
+                self._tx_id += 1
+                if self.trace:
+                    self.trace(f'AsyncRefresh(cache) on {sub_group}')
+                opc_group.AsyncRefresh(SOURCE_CACHE, self._tx_id)
+                log.info(f"AsyncRefresh dispatched for group '{sub_group}' "
+                         f"to populate initial values for {len(final_valid_tags)} items")
+            except Exception as e:
+                log.warning(f"AsyncRefresh failed for group '{sub_group}': {e}; "
+                            "subscribed items will populate only when their value changes")
+
             log.info(f"Subscribed to {len(final_valid_tags)} tags in group '{group}'")
             return final_valid_tags
 
