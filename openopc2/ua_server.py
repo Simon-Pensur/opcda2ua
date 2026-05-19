@@ -470,6 +470,10 @@ class OpcDaUaBridge:
         - NODO: SCADA node name (e.g., UYMVDA01)
         - TAG: Block/tag name (e.g., AI_TEMP_001)
         - CAMPO: Field (.F_CV or .A_CV)
+
+        Raises the underlying COM error on browser/discovery failure so the
+        caller can distinguish a transient iFIX failure (dead COM proxy, iFIX
+        not yet ready) from a legitimate empty result.
         """
         import time
         start_time = time.time()
@@ -574,6 +578,9 @@ class OpcDaUaBridge:
             print(f"[ERROR] Error en descubrimiento: {e}")
             import traceback
             traceback.print_exc()
+            elapsed = time.time() - start_time
+            log.info(f"iFIX discovery aborted after {elapsed:.1f} seconds (raising)")
+            raise
 
         elapsed = time.time() - start_time
 
@@ -618,17 +625,93 @@ class OpcDaUaBridge:
             log.info(f"Connected to OPC DA server: {opc_server} on {opc_host}")
             self._da_to_main_queue.put(('progress', 'connected'))
 
-            # Discover tags using appropriate method
+            # Discover tags using appropriate method.
+            # Initial discovery is retried with COM-client rebuild because
+            # at boot the bridge may race ahead of iFIX: CoCreateInstance of
+            # Intellution.OPCiFIX.1 succeeds before iFIX has finished
+            # publishing its address space, so the browser returns 0 nodes
+            # at root (or raises RPC_S_SERVER_UNAVAILABLE shortly after).
+            # Going live with 0 tags strands all UA clients on a dead
+            # namespace until manual restart.
             import time
             print("[PROGRESO] Iniciando listado de tags...")
             self._da_to_main_queue.put(('progress', 'discovering'))
 
-            if ifix_optimized:
-                log.info("Using iFIX optimized discovery (enumerate containers, assume .F_CV)")
-                tags = self._discover_tags_ifix_optimized()
-            else:
-                log.info("Using standard tag discovery")
-                tags = self._discover_tags_standard(ifix_only_fcv)
+            INITIAL_DISCOVERY_MAX_ATTEMPTS = 60   # 60 * 10s = up to 10 minutes
+            INITIAL_DISCOVERY_RETRY_SLEEP = 10
+            tags = []
+            for attempt in range(1, INITIAL_DISCOVERY_MAX_ATTEMPTS + 1):
+                if not self.da_thread_active:
+                    return
+                try:
+                    if ifix_optimized:
+                        if attempt == 1:
+                            log.info("Using iFIX optimized discovery (enumerate containers, assume .F_CV)")
+                        tags = self._discover_tags_ifix_optimized()
+                    else:
+                        if attempt == 1:
+                            log.info("Using standard tag discovery")
+                        tags = self._discover_tags_standard(ifix_only_fcv)
+                except Exception as discovery_exc:
+                    log.warning(
+                        f"Initial tag discovery failed (attempt {attempt}/{INITIAL_DISCOVERY_MAX_ATTEMPTS}): "
+                        f"{discovery_exc}"
+                    )
+                    print(
+                        f"[PROGRESO] Descubrimiento fallo (intento {attempt}/{INITIAL_DISCOVERY_MAX_ATTEMPTS}): "
+                        f"{discovery_exc}"
+                    )
+                    tags = []
+
+                if len(tags) > 0:
+                    if attempt > 1:
+                        log.info(f"Initial tag discovery succeeded on attempt {attempt} ({len(tags)} tags)")
+                        print(f"[PROGRESO] Descubrimiento OK en intento {attempt}: {len(tags)} tags")
+                    break
+
+                if attempt >= INITIAL_DISCOVERY_MAX_ATTEMPTS:
+                    log.error(
+                        f"Initial tag discovery returned 0 tags after {INITIAL_DISCOVERY_MAX_ATTEMPTS} "
+                        f"attempts; aborting bridge startup so the service wrapper can restart us"
+                    )
+                    print(
+                        f"[ERROR] Descubrimiento inicial fallo {INITIAL_DISCOVERY_MAX_ATTEMPTS} veces. "
+                        f"Saliendo para que WinSW reinicie."
+                    )
+                    raise RuntimeError(
+                        f"OPC DA tag discovery returned 0 tags after "
+                        f"{INITIAL_DISCOVERY_MAX_ATTEMPTS} attempts (iFIX not ready?)"
+                    )
+
+                # Rebuild the COM client before the next attempt. The current
+                # proxy may be dead (RPC_S_SERVER_UNAVAILABLE) once iFIX
+                # finishes its own startup sequence after we already grabbed
+                # a stale handle.
+                log.info(
+                    f"Initial discovery returned 0 tags; rebuilding OPC DA client and retrying in "
+                    f"{INITIAL_DISCOVERY_RETRY_SLEEP}s (attempt {attempt + 1}/{INITIAL_DISCOVERY_MAX_ATTEMPTS})"
+                )
+                print(
+                    f"[PROGRESO] 0 tags. Reconectando OPC DA y reintentando en "
+                    f"{INITIAL_DISCOVERY_RETRY_SLEEP}s..."
+                )
+                try:
+                    self.da_client.close()
+                except Exception:
+                    pass
+                # Sleep before reconnect so iFIX has time to come up.
+                slept = 0
+                while slept < INITIAL_DISCOVERY_RETRY_SLEEP and self.da_thread_active:
+                    time.sleep(0.5)
+                    slept += 0.5
+                if not self.da_thread_active:
+                    return
+                try:
+                    self.da_client = OpcDaClient(self.config)
+                    self.da_client.connect(opc_server, opc_host)
+                except Exception as reconnect_exc:
+                    log.warning(f"OPC DA reconnect failed during initial discovery retry: {reconnect_exc}")
+                    print(f"[PROGRESO] Reconexion fallo: {reconnect_exc}")
 
             # Read initial values, or skip and let subscriptions populate.
             tag_values = []
@@ -818,11 +901,76 @@ class OpcDaUaBridge:
                         refresh_start = time.time()
 
                         try:
-                            # Rediscover tags
-                            if ifix_optimized:
-                                new_tags = set(self._discover_tags_ifix_optimized())
-                            else:
-                                new_tags = set(self._discover_tags_standard(ifix_only_fcv))
+                            # Rediscover tags. A failure here is almost
+                            # always a stale COM proxy (iFIX restarted while
+                            # we held its server handle). Treat it as
+                            # transient and SKIP this refresh — do NOT
+                            # interpret an empty/error result as "all 20k
+                            # tags removed" and flip them all to Bad
+                            # quality, which is what the previous code did.
+                            discovery_failed = False
+                            try:
+                                if ifix_optimized:
+                                    new_tags = set(self._discover_tags_ifix_optimized())
+                                else:
+                                    new_tags = set(self._discover_tags_standard(ifix_only_fcv))
+                            except Exception as discovery_exc:
+                                discovery_failed = True
+                                new_tags = set()
+                                log.warning(
+                                    f"Periodic discovery raised {discovery_exc!r}; "
+                                    f"skipping this refresh and attempting COM reconnect"
+                                )
+                                print(
+                                    f"[PROGRESO] Refresco fallo: {discovery_exc}. "
+                                    f"Reconectando OPC DA en background."
+                                )
+
+                            # Guard against the dead-proxy pattern where
+                            # browser navigation returns 0 nodes without
+                            # raising. If discovery returned empty but we
+                            # previously had tags, treat it as transient
+                            # and skip.
+                            if not discovery_failed and not new_tags and current_tags:
+                                discovery_failed = True
+                                log.warning(
+                                    f"Periodic discovery returned 0 tags but "
+                                    f"{len(current_tags)} were known; treating as "
+                                    f"transient and skipping refresh"
+                                )
+                                print(
+                                    f"[PROGRESO] Refresco devolvio 0 tags pero "
+                                    f"teniamos {len(current_tags)}: descartando ciclo."
+                                )
+
+                            if discovery_failed:
+                                # Best-effort COM reconnect so the next
+                                # refresh has a chance to succeed. Existing
+                                # subscriptions stay in place; if they were
+                                # already dead, an external client (or a
+                                # WinSW restart) will eventually catch it.
+                                try:
+                                    self.da_client.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    self.da_client = OpcDaClient(self.config)
+                                    self.da_client.connect(opc_server, opc_host)
+                                    log.info("OPC DA client reconnected after refresh failure")
+                                    print("[PROGRESO] OPC DA reconectado tras fallo de refresco")
+                                except Exception as reconnect_exc:
+                                    log.warning(
+                                        f"OPC DA reconnect after refresh failure failed: {reconnect_exc}"
+                                    )
+                                refresh_elapsed = time.time() - refresh_start
+                                log.info(
+                                    f"Tag refresh skipped (transient failure) after {refresh_elapsed:.1f}s"
+                                )
+                                print(
+                                    f"[PROGRESO] Refresco saltado (fallo transitorio) en "
+                                    f"{refresh_elapsed:.1f}s"
+                                )
+                                continue
 
                             # Find added and removed tags
                             added_tags = new_tags - current_tags
