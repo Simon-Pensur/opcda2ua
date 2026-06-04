@@ -1042,7 +1042,7 @@ Notas:
     if not check_opc_wrapper_dll():
         print("\nERROR: La libreria wrapper de OPC no esta instalada.")
         print('Para instalarla ejecute "regsvr32 gbda_aut.dll" en una linea de comando como administrador.')
-        print("Si no cuenta con el archivo puede solicitarlo a gray-box.net/daawrapper.php\n")
+        print("Si no cuenta con el archivo puede obtenerlo en http://gray-box.net/daawrapper.php\n")
         sys.exit(1)
 
     # Configure logging - need to set level on the rich logger specifically

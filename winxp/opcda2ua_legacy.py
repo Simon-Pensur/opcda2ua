@@ -122,7 +122,7 @@ def parse_args():
     parser.add_argument(
         "--smart",
         action="store_true",
-        help="Filtro para filtro por convencion. Tags con .medida: expone "
+        help="Filtro inteligente por convencion de sufijos. Tags con .medida: expone "
              "solo X.medida (descarta X.*). Tags con .velocidad: expone "
              "X.velocidad, X.horasMarcha, X.alarmas, X.velocidadOp, "
              "X.velocidadProg. En ambos casos X.descripcion se lee como "
@@ -180,7 +180,7 @@ class LegacyBridge(object):
     # Tag discovery & filtering
     # ------------------------------------------------------------------
 
-    # Smart: properties to keep for .velocidad objects
+    # Smart mode: properties to keep for .velocidad objects
     _VELOCIDAD_PROPS = frozenset([
         'velocidad', 'horasMarcha', 'alarmas', 'velocidadOp', 'velocidadProg',
     ])
@@ -190,7 +190,7 @@ class LegacyBridge(object):
         """Remove duplicate tags that appear under multiple OPC DA branches.
 
         WinCC exposes the same tags under multiple paths, e.g.:
-          MYSERVER_SERVIDOR01::FAB_X.medida
+          MYSERVER01::FAB_X.medida
           List of all tags::FAB_X.medida
           FAB_X.medida
         We keep only the version without '::' prefix (shortest path).
@@ -249,7 +249,7 @@ class LegacyBridge(object):
         return tags
 
     def _filter_smart(self, tags):
-        """Smart mode: smart filtering for suffix-convention filtering.
+        """Smart mode: suffix-convention filtering (.medida / .velocidad).
 
         Rules:
           1. ALL bases ending in _I are discarded (description-only).
@@ -962,7 +962,7 @@ def main():
     mode = None
     if args.smart:
         mode = 'smart'
-        log.info("Mode: smart (suffix-convention filtering filtering)")
+        log.info("Mode: smart (suffix-convention filtering)")
     elif args.ifix:
         mode = 'ifix'
         log.info("Mode: iFIX (.F_CV/.A_CV filtering)")

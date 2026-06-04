@@ -11,7 +11,7 @@ REM ============================================
 set VM_USER=usuario
 set VM_HOST=localhost
 set VM_PATH=C:\opcda2ua
-set LOCAL_PATH=c:\Users\dev\Downloads\github\opcda2ua\openopc2
+set LOCAL_PATH=C:\dev\opcda2ua\openopc2
 
 echo ============================================
 echo   Syncing to VM...

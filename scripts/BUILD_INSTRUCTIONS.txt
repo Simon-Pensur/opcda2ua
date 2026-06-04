@@ -8,16 +8,16 @@ REQUISITOS:
 - Ambos deben ser 32-bit para compatibilidad con gbda_aut.dll
 
 UBICACIONES DE PYTHON 32-BIT:
-- Win10: C:\Users\dev\AppData\Local\Programs\Python\Python311-32\python.exe
-- Win7:  C:\Users\dev\AppData\Local\Programs\Python\Python38-32\python.exe
+- Win10: %LOCALAPPDATA%\Programs\Python\Python311-32\python.exe
+- Win7:  %LOCALAPPDATA%\Programs\Python\Python38-32\python.exe
 
 ============================================
   COMPILAR PARA WINDOWS 10/11
 ============================================
 
-cd c:\Users\dev\Downloads\github\opcda2ua\scripts
+cd C:\dev\opcda2ua\scripts
 
-"C:\Users\dev\AppData\Local\Programs\Python\Python311-32\python.exe" -m PyInstaller --clean opcda2ua.spec
+"%LOCALAPPDATA%\Programs\Python\Python311-32\python.exe" -m PyInstaller --clean opcda2ua.spec
 
 move /Y dist\opcda2ua.exe dist\opcda2ua_win10.exe
 
@@ -25,9 +25,9 @@ move /Y dist\opcda2ua.exe dist\opcda2ua_win10.exe
   COMPILAR PARA WINDOWS 7
 ============================================
 
-cd c:\Users\dev\Downloads\github\opcda2ua\scripts
+cd C:\dev\opcda2ua\scripts
 
-"C:\Users\dev\AppData\Local\Programs\Python\Python38-32\python.exe" -m PyInstaller --clean opcda2ua.spec
+"%LOCALAPPDATA%\Programs\Python\Python38-32\python.exe" -m PyInstaller --clean opcda2ua.spec
 
 move /Y dist\opcda2ua.exe dist\opcda2ua_win7.exe
 
@@ -36,10 +36,10 @@ move /Y dist\opcda2ua.exe dist\opcda2ua_win7.exe
 ============================================
 
 Win10:
-"C:\Users\dev\AppData\Local\Programs\Python\Python311-32\python.exe" -m pip install pyinstaller asyncua pywin32
+"%LOCALAPPDATA%\Programs\Python\Python311-32\python.exe" -m pip install pyinstaller asyncua pywin32
 
 Win7:
-"C:\Users\dev\AppData\Local\Programs\Python\Python38-32\python.exe" -m pip install pyinstaller asyncua pywin32
+"%LOCALAPPDATA%\Programs\Python\Python38-32\python.exe" -m pip install pyinstaller asyncua pywin32
 
 ============================================
   NOTAS IMPORTANTES
