@@ -154,6 +154,17 @@ class OpcDaUaBridge:
         self._description_batch_size = 500  # Batch size for fast iFIX description reads
         self._skip_initial_read = False  # Skip slow initial value read; let subscriptions populate
 
+        # Subscription liveness tracking. The DCOM advise sink can die silently
+        # after an iFIX/SCADA node restart: COM browse/read keep working and
+        # the bridge cache keeps serving last-known values with Good quality,
+        # but DataChange callbacks never resume. These fields drive a
+        # heartbeat+watchdog that detects and recovers from that condition.
+        self._subscribed_tag_groups: list = []  # [(group_name, [tags])] for re-subscribe
+        self._subscriptions_active: bool = False
+        self._last_data_change_time: float = 0.0  # Monotonic-ish wall time of last on_da_changes call
+        self._heartbeat_interval: float = 60.0    # AsyncRefresh(cache) every N seconds
+        self._stale_data_threshold: float = 180.0 # No data_change for N seconds -> assume dead sink
+
     def set_endpoint(self, endpoint: str):
         """Configure OPC UA server endpoint"""
         self._endpoint = endpoint
@@ -591,6 +602,46 @@ class OpcDaUaBridge:
 
         return value_tags
 
+    def _resubscribe_all(self, opc_server: str, opc_host: str, callback, update_rate: int) -> int:
+        """Drop the current OPC DA client and re-create + re-subscribe every
+        tracked group. Read-only against OPC DA — no writes are issued.
+
+        Used both by the periodic-refresh failure path (RPC_S_SERVER_UNAVAILABLE
+        on browse) and by the freshness watchdog (DCOM advise sink died silent).
+        Must be called from the DA thread that owns the COM apartment.
+        Returns the number of groups successfully re-subscribed.
+        """
+        try:
+            self.da_client.close()
+        except Exception:
+            pass
+        self.da_client = OpcDaClient(self.config)
+        self.da_client.connect(opc_server, opc_host)
+
+        groups = list(self._subscribed_tag_groups)
+        resubbed = 0
+        for group_name, tag_list in groups:
+            if not tag_list:
+                continue
+            try:
+                self.da_client.subscribe(
+                    tags=list(tag_list),
+                    callback=callback,
+                    group=group_name,
+                    update_rate=update_rate,
+                    deadband=0.0,
+                )
+                resubbed += 1
+            except Exception as sub_exc:
+                log.error(f"Re-subscribe failed for group {group_name}: {sub_exc}")
+        log.info(
+            f"Re-subscription complete: {resubbed}/{len(groups)} groups"
+        )
+        print(
+            f"[PROGRESO] Re-suscripcion: {resubbed}/{len(groups)} grupos"
+        )
+        return resubbed
+
     def _da_thread_main(self, opc_server: str, opc_host: str, ifix_only_fcv: bool = False, update_rate: int = 1000, include_descriptions: bool = False, ifix_optimized: bool = False, tag_refresh_interval: int = 600, skip_initial_read: bool = False):
         """Main thread for OPC DA (COM requires its own thread)"""
         import pythoncom
@@ -831,10 +882,19 @@ class OpcDaUaBridge:
             # Subscribe to all tags
             def on_da_changes(changes):
                 """Callback that receives OPC DA changes"""
+                # Liveness signal for the freshness watchdog: any DataChange
+                # callback (even an empty one) proves the DCOM advise sink is
+                # alive end-to-end.
+                self._last_data_change_time = time.time()
                 self._da_to_main_queue.put(('data_change', changes))
 
             # Extract tag names from tag_values for subscription
             tag_names = [tv[0] for tv in tag_values]
+
+            # Reset subscription tracking on (re)entry to this loop. The
+            # watchdog and the periodic-refresh failure path both depend on
+            # this mirror of the active groups to know what to re-subscribe.
+            self._subscribed_tag_groups = []
 
             # Split into groups if there are many tags (typical limit: ~1000 per group)
             chunk_size = 1000
@@ -844,14 +904,16 @@ class OpcDaUaBridge:
 
             for i, chunk_start in enumerate(range(0, len(tag_names), chunk_size)):
                 chunk = tag_names[chunk_start:chunk_start + chunk_size]
+                group_name = f"ua_bridge_{i}"
                 try:
                     self.da_client.subscribe(
                         tags=chunk,
                         callback=on_da_changes,
-                        group=f"ua_bridge_{i}",
+                        group=group_name,
                         update_rate=update_rate,
                         deadband=0.0
                     )
+                    self._subscribed_tag_groups.append((group_name, list(chunk)))
                     # Report progress after each chunk
                     progress_pct = 100 * (i + 1) // total_chunks
                     log.info(f"Subscribed group {i+1}/{total_chunks} ({progress_pct}%)")
@@ -861,6 +923,14 @@ class OpcDaUaBridge:
 
             log.info(f"Subscribed to {len(tag_names)} tags in OPC DA")
             self._da_to_main_queue.put(('progress', 'subscribed'))
+
+            # Arm the freshness watchdog. We just subscribed; AsyncRefresh
+            # from cache (triggered inside subscribe()) should produce a
+            # data_change within update_rate, so set the initial timestamp
+            # to "now" to allow that to land before the stale check fires.
+            self._last_data_change_time = time.time()
+            self._subscriptions_active = True
+            last_heartbeat = time.time()
 
             # Track current tags for refresh comparison
             current_tags = set(tag_names)
@@ -890,6 +960,69 @@ class OpcDaUaBridge:
                             log.error(f"DA write failed for {tag}: {e}")
                 except Empty:
                     pass
+
+                # Heartbeat + freshness watchdog. Detects the silent-failure
+                # mode where the COM proxy still answers browse/read but the
+                # DCOM advise sink stopped firing (typical after an iFIX
+                # node restart or plant stop). Without this, the bridge
+                # would keep serving stale Good-quality values forever.
+                if self._subscriptions_active:
+                    now_ts = time.time()
+
+                    # Heartbeat: AsyncRefresh(cache) on every group every
+                    # _heartbeat_interval. iFIX re-dispatches DataChange
+                    # callbacks with current cached values, so we always
+                    # see *some* data_change as long as the sink lives —
+                    # this kills the false-positive that a steady-state
+                    # plant produces no callbacks.
+                    if now_ts - last_heartbeat >= self._heartbeat_interval:
+                        last_heartbeat = now_ts
+                        try:
+                            self.da_client.refresh_subscriptions_cache()
+                        except Exception as hb_exc:
+                            log.warning(
+                                f"Heartbeat refresh_subscriptions_cache failed: {hb_exc}"
+                            )
+
+                    # Watchdog: no data_change for _stale_data_threshold
+                    # seconds means the sink is dead. Rebuild the OPC DA
+                    # client and re-subscribe every tracked group.
+                    if (
+                        self._last_data_change_time > 0
+                        and now_ts - self._last_data_change_time
+                        >= self._stale_data_threshold
+                    ):
+                        stale_for = now_ts - self._last_data_change_time
+                        log.warning(
+                            f"WATCHDOG: no OPC DA data_change events in "
+                            f"{stale_for:.0f}s (threshold "
+                            f"{self._stale_data_threshold:.0f}s). DCOM "
+                            f"advise sink is dead. Rebuilding client and "
+                            f"re-subscribing "
+                            f"{len(self._subscribed_tag_groups)} groups."
+                        )
+                        print(
+                            f"[PROGRESO] WATCHDOG: sin data_change hace "
+                            f"{stale_for:.0f}s. Re-suscribiendo..."
+                        )
+                        try:
+                            self._resubscribe_all(
+                                opc_server, opc_host, on_da_changes, update_rate
+                            )
+                        except Exception as wd_exc:
+                            log.error(
+                                f"WATCHDOG: re-subscribe failed: {wd_exc}"
+                            )
+                            print(
+                                f"[PROGRESO] WATCHDOG fallo: {wd_exc}"
+                            )
+                        # Reset the freshness clock so the watchdog does
+                        # not loop during the heal/grace window even if
+                        # the re-subscribe itself was unsuccessful. The
+                        # next cycle (_stale_data_threshold seconds out)
+                        # will try again.
+                        self._last_data_change_time = now_ts
+                        last_heartbeat = now_ts
 
                 # Check if it's time to refresh the tag list
                 if tag_refresh_interval > 0:
@@ -944,23 +1077,31 @@ class OpcDaUaBridge:
                                 )
 
                             if discovery_failed:
-                                # Best-effort COM reconnect so the next
-                                # refresh has a chance to succeed. Existing
-                                # subscriptions stay in place; if they were
-                                # already dead, an external client (or a
-                                # WinSW restart) will eventually catch it.
+                                # Best-effort COM reconnect AND re-subscribe.
+                                # A bare reconnect leaves the new da_client
+                                # with zero groups, so DataChange callbacks
+                                # never resume and UA clients keep seeing
+                                # stale Good-quality values (the original
+                                # 2026-06-21 freeze pattern). We rebuild
+                                # the client and re-AddItems every tracked
+                                # group so the advise sink is restored.
                                 try:
-                                    self.da_client.close()
-                                except Exception:
-                                    pass
-                                try:
-                                    self.da_client = OpcDaClient(self.config)
-                                    self.da_client.connect(opc_server, opc_host)
-                                    log.info("OPC DA client reconnected after refresh failure")
-                                    print("[PROGRESO] OPC DA reconectado tras fallo de refresco")
+                                    self._resubscribe_all(
+                                        opc_server, opc_host, on_da_changes, update_rate
+                                    )
+                                    log.info(
+                                        "OPC DA client reconnected and re-subscribed after refresh failure"
+                                    )
+                                    print(
+                                        "[PROGRESO] OPC DA reconectado y re-suscrito tras fallo de refresco"
+                                    )
+                                    # Subscriptions just came up; give them
+                                    # update_rate to land a data_change.
+                                    self._last_data_change_time = time.time()
+                                    last_heartbeat = time.time()
                                 except Exception as reconnect_exc:
                                     log.warning(
-                                        f"OPC DA reconnect after refresh failure failed: {reconnect_exc}"
+                                        f"OPC DA reconnect+resubscribe after refresh failure failed: {reconnect_exc}"
                                     )
                                 refresh_elapsed = time.time() - refresh_start
                                 log.info(
@@ -1014,13 +1155,17 @@ class OpcDaUaBridge:
                                                 pass
 
                                 # Subscribe to new tags
+                                new_group_name = f"ua_bridge_{next_group_id}"
                                 try:
                                     self.da_client.subscribe(
                                         tags=added_list,
                                         callback=on_da_changes,
-                                        group=f"ua_bridge_{next_group_id}",
+                                        group=new_group_name,
                                         update_rate=update_rate,
                                         deadband=0.0
+                                    )
+                                    self._subscribed_tag_groups.append(
+                                        (new_group_name, list(added_list))
                                     )
                                     next_group_id += 1
                                     log.info(f"Subscribed to {len(added_list)} new tags")
@@ -1036,6 +1181,14 @@ class OpcDaUaBridge:
                                 # Notify main thread about removed tags (will set quality to Bad)
                                 self._da_to_main_queue.put(('removed_tags', list(removed_tags)))
                                 current_tags -= removed_tags
+                                # Prune from the resubscribe mirror so a
+                                # subsequent watchdog-driven re-subscribe
+                                # does not try to AddItems a tag iFIX no
+                                # longer publishes.
+                                self._subscribed_tag_groups = [
+                                    (g, [t for t in tlist if t not in removed_tags])
+                                    for g, tlist in self._subscribed_tag_groups
+                                ]
 
                         except Exception as e:
                             log.error(f"Error during tag refresh: {e}")

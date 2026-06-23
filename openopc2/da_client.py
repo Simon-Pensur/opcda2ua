@@ -1255,6 +1255,37 @@ class OpcDaClient:
             error_msg = f'subscribe: {self._get_error_str(err)}'
             raise OPCError(error_msg)
 
+    def refresh_subscriptions_cache(self):
+        """Force a cache-source AsyncRefresh on every active subscription group.
+
+        The OPC DA server dispatches OnDataChange callbacks with the current
+        cached values for every item in the group, regardless of whether the
+        value changed. Used as a liveness probe for the DCOM advise sink:
+        if no DataChange callbacks arrive within update_rate after this call,
+        the sink is dead even though COM browse/read may still succeed.
+
+        Read-only against the OPC DA server (no writes).
+        Safe to call from the COM thread that owns this client.
+        Returns the number of groups successfully pinged.
+        """
+        if not self.connected or not self._opc:
+            return 0
+        opc_groups = self._opc.groups
+        refreshed = 0
+        for sub_group in list(self._subscription_tags.keys()):
+            try:
+                opc_group = opc_groups.GetOPCGroup(sub_group)
+                if self._tx_id >= 0xFFFF:
+                    self._tx_id = 0
+                self._tx_id += 1
+                opc_group.AsyncRefresh(SOURCE_CACHE, self._tx_id)
+                refreshed += 1
+            except Exception as e:
+                if self.trace:
+                    self.trace(f'refresh_subscriptions_cache: {sub_group} failed: {e}')
+                continue
+        return refreshed
+
     def unsubscribe(self, tags=None, group=None):
         """
         Cancel subscriptions.
